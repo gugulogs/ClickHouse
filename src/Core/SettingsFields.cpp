@@ -144,7 +144,8 @@ namespace
         }
         else
             throw Exception(
-                ErrorCodes::CANNOT_CONVERT_TYPE, "Invalid value {} of the setting, which needs {}", f, demangle(typeid(T).name()));
+                ErrorCodes::CANNOT_CONVERT_TYPE, "Invalid value of type {} of the setting, which needs {}",
+                f.getTypeName(), demangle(typeid(T).name()));
     }
 
     Map stringToMap(const String & str)
