@@ -1455,22 +1455,18 @@ Comma-separated list of users to ignore an early memory limit check. If user is 
 If true, ClickHouse creates all configured `system.*_log` tables before the startup. It can be helpful if some startup scripts depend on these tables.
 )", 0) \
     DECLARE(Bool, use_shared_merge_tree_log_pipeline, false, R"(
-Only available on ClickHouse Cloud. When enabled, `system.*_log` tables are backed by `SharedMergeTree` via an S3-based pipeline.
-For each log `<log>`, the following objects are created automatically on startup:
+Only available on ClickHouse Cloud. When enabled, the system logs are written through a `SharedMergeTree` pipeline
+and the `system` database becomes a Shared database, so every replica sees the same log tables.
 
-- `system.<log>_s3` — an `S3`-backed table that is the direct flush target; each
-  `SYSTEM FLUSH LOGS` call writes a new partitioned file here.
-- `system.<log>_s3queue` — an `S3Queue` table (ordered mode) that picks up files from
-  `<log>_s3` and streams rows downstream. Each node processes only its own files via
-  `partition_regex`-based partitioning.
-- `system.<log>_mv` — a `MATERIALIZED VIEW` that routes rows from `<log>_s3queue` into
-  the final `SharedMergeTree` table.
-- `system.<log>` — the final `SharedMergeTree` table where rows accumulate and are queried.
+Each flush of a log writes a `Native` file with the `s3` (or `azureBlobStorage`) table function into the folder of the
+log's generation, the hash of its columns and keys. Per generation the pipeline keeps the queue `system._<log>_s3queue_<hash>`
+reading that folder, the materialized view `system._<log>_mv_<hash>` and the `SharedMergeTree` table `system.<log>_<hash>`.
+`system.<log>` is a `Merge` table over the generations. A new schema creates a new generation; settings, TTL and indices
+come from the `smt_settings`, `smt_ttl` and `smt_indices` keys of the log's configuration and are changed in place.
+The objects are created on the first flush of a log, or at startup with `prepare_system_log_tables_on_startup`.
 
-On schema or settings change, the affected table is renamed to `<log>_0`, `<log>_1`, etc.
-and recreated, consistent with the existing `SystemLog` rotation behavior.
-
-Requires `<shared_log_pipeline><endpoint>` to be set in the server configuration.
+The local `system` database is renamed to `system_local` while the setting is enabled. Requires `shared_database_catalog`
+and `<shared_log_pipeline><endpoint>` in the server configuration.
 See also: `shared_log_pipeline.enable_sync_flush`, `shared_log_pipeline.flush_timeout_seconds`.
 )", EXPERIMENTAL) \
     DECLARE(UInt64, config_reload_interval_ms, 2000, R"(
@@ -1540,8 +1536,8 @@ Threads for cleanup of shared merge tree parts killer threads. Only available in
     DECLARE(NonZeroUInt64, parts_killer_max_condemned_parts_per_batch, 100000, R"(
 Maximum number of condemned parts a SharedMergeTree table fetches from Keeper in a single cleanup cycle. Bounding the batch keeps the listing and multi-get within the Keeper operation timeout, so cleanup keeps making progress even when a table has accumulated a very large condemned-parts backlog. Must be greater than zero: a value of `0` would make Keeper return an empty listing every cycle, permanently stalling cleanup. Only available in ClickHouse Cloud
 )", 0) \
-    DECLARE(UInt64, snapshot_cleaner_period, 120, R"(
-Period to completely remove snapshot parts for SharedMergeTree. Only available in ClickHouse Cloud
+    DECLARE(UInt64, snapshot_cleaner_period, 3600, R"(
+Period in seconds to completely remove snapshot parts for SharedMergeTree. Only available in ClickHouse Cloud
 )", 0) \
     DECLARE(UInt64, snapshot_cleaner_pool_size, 128, R"(
 Threads for cleanup of shared merge tree snapshot cleaner threads. Only available in ClickHouse Cloud
@@ -1583,6 +1579,7 @@ Maximum size of batch for MultiRead request to [Zoo]Keeper that support batching
     DECLARE(NonZeroUInt64, distributed_cache_warmer_max_file_segment_size, 32_MiB, R"(Only has an effect in ClickHouse Cloud. The size of the ranges in which the cache warmer reads a fetched part into the distributed cache when the disk of the part has no local filesystem cache (with a local cache the warmer uses its `max_file_segment_size`).)", 0) \
     DECLARE(UInt64, distributed_cache_warmer_max_bytes_in_queue, 100_GiB, R"(Only has an effect in ClickHouse Cloud. The maximum total size of the ranges the cache warmer keeps queued for a disk without a local filesystem cache; the oldest ranges are discarded beyond it (with a local cache the warmer uses its `max_size`). Zero means unlimited.)", 0) \
     DECLARE(UInt64, distributed_cache_warmer_max_segments_in_queue, 100000, R"(Only has an effect in ClickHouse Cloud. The maximum number of ranges the cache warmer keeps queued for a disk without a local filesystem cache; the oldest ranges are discarded beyond it (with a local cache the warmer uses its `max_elements`). Zero means unlimited.)", 0) \
+    DECLARE(Bool, distributed_cache_warmer_skip_parts_produced_in_current_availability_zone, true, R"(Only has an effect in ClickHouse Cloud. When the cache warmer warms the distributed cache alone (the part's disk has no local filesystem cache, or the cache is disabled for reads), skip the parts that were produced by a replica in the current availability zone: written through the distributed cache, they are already in the cache of this zone. Parts of unknown origin are always warmed.)", 0) \
     DECLARE(Bool, enable_write_through_distributed_cache, false, R"(Only has an effect in ClickHouse Cloud. Allow writing to distributed cache (writing to s3 will also be done by distributed cache). This is a server-level switch, applied without a restart, so that background operations which do not have a query profile of their own (merges, mutations, `Buffer` table flushes) follow it as well. Individual queries can deviate from it with the `force_write_through_distributed_cache` setting.)", 0) \
     DECLARE(UInt32, allow_feature_tier, 0, R"(
 Controls if the user can change settings related to the different feature tiers.
@@ -2080,8 +2077,8 @@ Whether the server isolates itself from the filesystem of the host at startup, k
 
 At startup, before it starts any thread, the server moves itself into a new [mount namespace](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html) whose root is an empty read-only `tmpfs`, bind-mounts into it, at their usual locations, only the paths it needs, and removes the original root with `pivot_root`. What stays visible:
 
-- The paths from the configuration that the server writes: `path`, `tmp_path`, `user_files_path`, `format_schema_path`, `filesystem_caches_path`, the directories of the local disks and of the metadata of the other disks in `storage_configuration`, the directories of the log files, of the pid file and of `core_path`, the storage directories of the embedded Keeper, `access_control_path`, the paths of all the `local_directory` entries in `user_directories`, `user_defined_path`, `workload_path`, `named_collections_storage.path`, `backups.allowed_path`. They are mounted read-write, but with `noexec`, so that nothing written there can be executed.
-- The paths from the configuration that the server only reads, mounted read-only: the directory of the configuration file, the directories of the included files and of the targets of the symbolic links among the configuration files, `users_config`, `user_scripts_path` (programs in it can be executed), `top_level_domains_path`, `google_protos_path`, the directories of the TLS certificates and keys in `openSSL`, `grpc`, `ldap_servers`, the Kerberos keytab, and the `clickhouse-odbc-bridge` program next to the server's executable, with its dynamic loader and the shared libraries it needs, as the dynamic loader finds them. The locations of the logs of the bridge (`logger.odbc_bridge_log`, `logger.odbc_bridge_errlog`, `logger.odbc_bridge_stdout`, `logger.odbc_bridge_stderr`) are writable.
+- The paths from the configuration that the server writes: `path`, `tmp_path`, `user_files_path`, `format_schema_path`, `filesystem_caches_path`, the directories of the local disks and of the metadata of the other disks in `storage_configuration`, the directories of the log files, of the pid file and of `core_path`, the storage directories of the embedded Keeper, `access_control_path`, the paths of all the `local_directory` entries in `user_directories`, `user_defined_path`, `workload_path`, `named_collections_storage.path`, `backups.allowed_path`, the working directory of every `distributed_cache_server` section and the cache directory of each. They are mounted read-write, but with `noexec`, so that nothing written there can be executed.
+- The paths from the configuration that the server only reads, mounted read-only: the directory of the configuration file, the directories of the included files and of the targets of the symbolic links among the configuration files, `users_config`, `user_scripts_path` (programs in it can be executed), `top_level_domains_path`, `google_protos_path`, the directories of the TLS certificates and keys in `openSSL`, `grpc`, `ldap_servers`, of the certificate and the key of every `distributed_cache_server` section and of the certificate chain of `distributed_cache_client`, the Kerberos keytab, and the `clickhouse-odbc-bridge` program next to the server's executable, with its dynamic loader and the shared libraries it needs, as the dynamic loader finds them. The locations of the logs of the bridge (`logger.odbc_bridge_log`, `logger.odbc_bridge_errlog`, `logger.odbc_bridge_stdout`, `logger.odbc_bridge_stderr`) are writable.
 - The executable of the server and the shared libraries it is linked with, with the symbolic links next to them that name them (such as `libc.so.6`), and the directory of the heap profiles of jemalloc if its `prof_prefix` option is set.
 - What a program on Linux needs: `/proc` (with `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`, `/proc/fs` and `/proc/irq` and the mounts inside them read-only, as in the containers of Docker), `/sys` (read-only), `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, a private instance of `devpts` at `/dev/pts` with `/dev/ptmx` for the pseudoterminals of the web terminal and the SSH server, the network configuration in `/etc` (`hosts`, `resolv.conf`, `nsswitch.conf`, `host.conf`, `gai.conf`, `services`, `protocols`), `/etc/passwd`, `/etc/group`, `/etc/localtime`, the time zone database and the CA certificates (`/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/usr/share/ca-certificates`, `/usr/local/share/ca-certificates`) with the targets of the links inside them, as in a CA directory given in `caConfig`, `/usr/lib/debug` for the symbols in stack traces, the socket of the service manager from the `NOTIFY_SOCKET` environment variable, and `/dev/log` if `logger.use_syslog` is enabled. If `/dev/log` is a symbolic link, as `/dev/log -> /run/systemd/journal/dev-log` with systemd, the directory of its target is visible, so that a socket recreated there by a restarted service is seen. A socket directly in `/dev` that the syslog daemon recreates when it restarts is not seen again until the server restarts, because the `/dev` of the host is not visible.
 - A private empty `/tmp`.
@@ -2752,6 +2749,9 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
 
         /// Startup
         "startup_scripts",
+#if CLICKHOUSE_CLOUD
+        "predefined_system_tables",
+#endif
         "fail_points_active",
 
         /// SSL and security
